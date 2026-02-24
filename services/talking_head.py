@@ -1,120 +1,140 @@
 import asyncio
 import base64
 import logging
+import time
 
 import httpx
+import jwt
 
 from bot.config import (
-    DID_API_BASE,
-    DID_API_KEY,
-    DID_POLL_INTERVAL_SECONDS,
-    DID_POLL_MAX_ATTEMPTS,
+    KLING_ACCESS_KEY,
+    KLING_API_BASE,
+    KLING_POLL_INTERVAL_SECONDS,
+    KLING_POLL_MAX_ATTEMPTS,
+    KLING_SECRET_KEY,
     DEFAULT_AVATAR_URL,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _auth_header() -> dict[str, str]:
-    encoded = base64.b64encode(f"{DID_API_KEY}:".encode()).decode()
+def _generate_jwt_token() -> str:
+    """Generate a JWT token for Kling AI API authentication."""
+    now = int(time.time())
+    headers = {"alg": "HS256", "typ": "JWT"}
+    payload = {
+        "iss": KLING_ACCESS_KEY,
+        "exp": now + 1800,
+        "nbf": now - 5,
+    }
+    return jwt.encode(payload, KLING_SECRET_KEY, algorithm="HS256", headers=headers)
+
+
+def _auth_headers() -> dict[str, str]:
+    token = _generate_jwt_token()
     return {
-        "Authorization": f"Basic {encoded}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
+
+
+async def _download_image_as_base64(url: str) -> str:
+    """Download an image from a URL and return it as a base64 string."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+    return base64.b64encode(resp.content).decode()
 
 
 async def create_talking_head_video(
     audio_bytes: bytes,
     avatar_url: str | None = None,
 ) -> bytes:
-    """Generate a talking head video from audio bytes and a face image URL.
+    """Generate a talking head video using Kling AI's avatar/lip-sync API.
 
-    Returns the final MP4 video as bytes.
+    Takes audio bytes and a face image URL, returns the final MP4 video bytes.
     """
     avatar_url = avatar_url or DEFAULT_AVATAR_URL
 
-    # Upload audio to D-ID
-    audio_url = await _upload_audio(audio_bytes)
+    # Convert face image to base64
+    logger.info("Downloading avatar image from %s", avatar_url)
+    image_b64 = await _download_image_as_base64(avatar_url)
 
-    # Create the talk
-    talk_id = await _create_talk(avatar_url, audio_url)
+    # Convert audio to base64
+    audio_b64 = base64.b64encode(audio_bytes).decode()
+
+    # Create the avatar/lip-sync task
+    task_id = await _create_avatar_task(image_b64, audio_b64)
 
     # Poll until done
-    result_url = await _poll_talk(talk_id)
+    result_url = await _poll_task(task_id)
 
     # Download the result video
-    video_bytes = await _download_video(result_url)
-    return video_bytes
+    return await _download_video(result_url)
 
 
-async def _upload_audio(audio_bytes: bytes) -> str:
-    """Upload audio to D-ID and return the URL."""
-    logger.info("Uploading audio to D-ID: %d bytes", len(audio_bytes))
+async def _create_avatar_task(image_b64: str, audio_b64: str) -> str:
+    """Create a Kling avatar lip-sync task. Returns the task ID."""
+    logger.info("Creating Kling avatar task...")
+    payload = {
+        "image": image_b64,
+        "sound_file": audio_b64,
+        "mode": "std",
+    }
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
-            f"{DID_API_BASE}/audios",
-            headers={"Authorization": _auth_header()["Authorization"]},
-            files={"audio": ("audio.mp3", audio_bytes, "audio/mpeg")},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    url = data["url"]
-    logger.info("Audio uploaded: %s", url)
-    return url
-
-
-async def _create_talk(avatar_url: str, audio_url: str) -> str:
-    """Create a D-ID talk and return the talk ID."""
-    logger.info("Creating D-ID talk: avatar=%s", avatar_url)
-    payload = {
-        "source_url": avatar_url,
-        "script": {
-            "type": "audio",
-            "audio_url": audio_url,
-        },
-    }
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{DID_API_BASE}/talks",
-            headers=_auth_header(),
+            f"{KLING_API_BASE}/v1/videos/avatar/image2video",
+            headers=_auth_headers(),
             json=payload,
         )
         resp.raise_for_status()
         data = resp.json()
-    talk_id = data["id"]
-    logger.info("Talk created: %s", talk_id)
-    return talk_id
+
+    if data.get("code") != 0:
+        raise RuntimeError(f"Kling API error: {data.get('message', 'Unknown error')}")
+
+    task_id = data["data"]["task_id"]
+    logger.info("Avatar task created: %s", task_id)
+    return task_id
 
 
-async def _poll_talk(talk_id: str) -> str:
-    """Poll a D-ID talk until it's done. Returns the result video URL."""
-    logger.info("Polling talk %s for completion...", talk_id)
+async def _poll_task(task_id: str) -> str:
+    """Poll a Kling avatar task until completion. Returns the video URL."""
+    logger.info("Polling task %s...", task_id)
     async with httpx.AsyncClient(timeout=30) as client:
-        for attempt in range(1, DID_POLL_MAX_ATTEMPTS + 1):
+        for attempt in range(1, KLING_POLL_MAX_ATTEMPTS + 1):
             resp = await client.get(
-                f"{DID_API_BASE}/talks/{talk_id}",
-                headers=_auth_header(),
+                f"{KLING_API_BASE}/v1/videos/avatar/image2video/{task_id}",
+                headers=_auth_headers(),
             )
             resp.raise_for_status()
             data = resp.json()
-            status = data.get("status")
 
-            if status == "done":
-                result_url = data["result_url"]
-                logger.info("Talk %s done: %s", talk_id, result_url)
+            if data.get("code") != 0:
+                raise RuntimeError(
+                    f"Kling poll error: {data.get('message', 'Unknown error')}"
+                )
+
+            task_data = data["data"]
+            status = task_data.get("task_status")
+
+            if status == "succeed":
+                videos = task_data["task_result"]["videos"]
+                result_url = videos[0]["url"]
+                logger.info("Task %s succeeded: %s", task_id, result_url)
                 return result_url
 
-            if status in ("error", "rejected"):
-                error_msg = data.get("error", {}).get("description", "Unknown error")
-                raise RuntimeError(f"D-ID talk failed: {error_msg}")
+            if status == "failed":
+                msg = task_data.get("task_status_msg", "Unknown failure")
+                raise RuntimeError(f"Kling task failed: {msg}")
 
             logger.debug(
-                "Talk %s status=%s (attempt %d/%d)",
-                talk_id, status, attempt, DID_POLL_MAX_ATTEMPTS,
+                "Task %s status=%s (attempt %d/%d)",
+                task_id, status, attempt, KLING_POLL_MAX_ATTEMPTS,
             )
-            await asyncio.sleep(DID_POLL_INTERVAL_SECONDS)
+            await asyncio.sleep(KLING_POLL_INTERVAL_SECONDS)
 
-    raise TimeoutError(f"Talk {talk_id} did not complete within polling limit")
+    raise TimeoutError(f"Task {task_id} did not complete within polling limit")
 
 
 async def _download_video(url: str) -> bytes:
