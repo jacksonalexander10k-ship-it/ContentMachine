@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Media files (generated)
+*.mp4
+*.mp3
+*.wav
+*.ogg
+*.webm
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Plan file
+plan.md
