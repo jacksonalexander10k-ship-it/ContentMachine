@@ -8,7 +8,7 @@ from telegram.ext import (
     filters,
 )
 
-from bot.config import TELEGRAM_BOT_TOKEN
+from bot.config import TELEGRAM_BOT_TOKEN, WEBHOOK_PORT, WEBHOOK_URL
 from bot.handlers import (
     avatar_command,
     avatar_reset_command,
@@ -21,6 +21,8 @@ from bot.handlers import (
     voice_command,
 )
 from bot.keyboards import VOICE_CALLBACK_PREFIX
+from services.database import init_db
+from services.talking_head import check_kling_credentials
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -29,11 +31,32 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def post_init(application) -> None:
+    """Run after bot initialization — database setup and health checks."""
+    await init_db()
+
+    me = await application.bot.get_me()
+    logger.info("Bot connected as @%s (id=%d)", me.username, me.id)
+
+    if await check_kling_credentials():
+        logger.info("Kling AI credentials verified.")
+    else:
+        logger.warning(
+            "Could not verify Kling AI credentials. "
+            "Video generation may fail — check KLING_ACCESS_KEY and KLING_SECRET_KEY."
+        )
+
+
 def main() -> None:
     """Start the Telegram bot."""
     logger.info("Starting ContentMachine bot...")
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     # Commands
     app.add_handler(CommandHandler("start", start_command))
@@ -54,8 +77,17 @@ def main() -> None:
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
 
-    logger.info("Bot is running. Press Ctrl+C to stop.")
-    app.run_polling(drop_pending_updates=True)
+    if WEBHOOK_URL:
+        logger.info("Running in webhook mode on port %d", WEBHOOK_PORT)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=WEBHOOK_PORT,
+            url_path=TELEGRAM_BOT_TOKEN,
+            webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_BOT_TOKEN}",
+        )
+    else:
+        logger.info("Running in polling mode.")
+        app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":

@@ -1,22 +1,32 @@
 import io
 import logging
 
+import httpx
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
-from bot.config import DEFAULT_TTS_VOICE, MAX_TEXT_LENGTH, AVAILABLE_VOICES
-from bot.keyboards import voice_selection_keyboard, VOICE_CALLBACK_PREFIX
+from bot.config import (
+    AVAILABLE_VOICES,
+    DEFAULT_AVATAR_URL,
+    KLING_POLL_INTERVAL_SECONDS,
+    MAX_AUDIO_DURATION_SECONDS,
+    MAX_TEXT_LENGTH,
+)
+from bot.keyboards import VOICE_CALLBACK_PREFIX, voice_selection_keyboard
+from services.database import (
+    clear_user_avatar,
+    get_user_avatar,
+    get_user_voice,
+    set_user_avatar,
+    set_user_voice,
+)
+from services.talking_head import KlingAPIError, create_talking_head_video
 from services.tts import text_to_speech
 from services.transcribe import transcribe_audio
-from services.talking_head import create_talking_head_video
 from utils.media import download_telegram_file
 
 logger = logging.getLogger(__name__)
-
-# Per-user state keys
-USER_VOICE = "tts_voice"
-USER_AVATAR = "avatar_url"
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -44,7 +54,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /voice — show voice picker."""
-    current = context.user_data.get(USER_VOICE, DEFAULT_TTS_VOICE)
+    current = await get_user_voice(update.effective_user.id)
     keyboard = voice_selection_keyboard(current)
     await update.message.reply_text(
         f"Current voice: *{current.capitalize()}*\n\nPick a new voice:",
@@ -55,7 +65,7 @@ async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def avatar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /avatar — show current avatar info."""
-    avatar = context.user_data.get(USER_AVATAR)
+    avatar = await get_user_avatar(update.effective_user.id)
     if avatar:
         await update.message.reply_text(
             "You have a custom avatar set.\n"
@@ -70,7 +80,7 @@ async def avatar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def avatar_reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /avatar_reset — clear custom avatar."""
-    context.user_data.pop(USER_AVATAR, None)
+    await clear_user_avatar(update.effective_user.id)
     await update.message.reply_text("Avatar reset to default.")
 
 
@@ -86,17 +96,91 @@ async def voice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not data.startswith(VOICE_CALLBACK_PREFIX):
         return
 
-    voice = data[len(VOICE_CALLBACK_PREFIX) :]
+    voice = data[len(VOICE_CALLBACK_PREFIX):]
     if voice not in AVAILABLE_VOICES:
         return
 
-    context.user_data[USER_VOICE] = voice
+    await set_user_voice(update.effective_user.id, voice)
     keyboard = voice_selection_keyboard(voice)
     await query.edit_message_text(
         f"Voice set to *{voice.capitalize()}*!",
         reply_markup=keyboard,
         parse_mode="Markdown",
     )
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+async def _get_avatar_bytes(user_id: int) -> bytes | None:
+    """Get avatar bytes for a user — custom from DB, or downloaded from default URL."""
+    avatar = await get_user_avatar(user_id)
+    if avatar:
+        return avatar
+
+    if DEFAULT_AVATAR_URL:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(DEFAULT_AVATAR_URL)
+                resp.raise_for_status()
+                return resp.content
+        except Exception:
+            logger.warning("Failed to download default avatar from %s", DEFAULT_AVATAR_URL)
+
+    return None
+
+
+async def _generate_video(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    audio_bytes: bytes,
+) -> None:
+    """Shared logic for generating and sending a talking-head video."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    avatar_bytes = await _get_avatar_bytes(user_id)
+    if not avatar_bytes:
+        await update.message.reply_text(
+            "You don't have an avatar set yet.\n"
+            "Send me a photo of a face first, then try again!"
+        )
+        return
+
+    status_msg = await update.message.reply_text("Starting video generation...")
+    await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+
+    async def progress_cb(status: str, attempt: int, max_attempts: int) -> None:
+        elapsed = attempt * KLING_POLL_INTERVAL_SECONDS
+        try:
+            await status_msg.edit_text(f"Generating video... ({elapsed}s elapsed)")
+            await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+        except Exception:
+            pass  # Message edit can fail if text is unchanged or rate-limited
+
+    try:
+        video_bytes = await create_talking_head_video(
+            audio_bytes, avatar_bytes, progress_callback=progress_cb
+        )
+        await status_msg.edit_text("Uploading video...")
+        await update.message.reply_video(
+            video=io.BytesIO(video_bytes),
+            filename="talking_head.mp4",
+            caption="Here's your talking-head video!",
+        )
+        await status_msg.delete()
+    except KlingAPIError as e:
+        logger.exception("Kling API error during video generation")
+        await status_msg.edit_text(f"Error: {e.user_message}")
+    except TimeoutError:
+        await status_msg.edit_text(
+            "Video generation timed out. The service may be overloaded — please try again later."
+        )
+    except Exception:
+        logger.exception("Failed to generate video")
+        await status_msg.edit_text(
+            "Sorry, something went wrong generating your video. Please try again."
+        )
 
 
 # ── Message handlers ─────────────────────────────────────────────────────────
@@ -116,37 +200,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    voice = context.user_data.get(USER_VOICE, DEFAULT_TTS_VOICE)
-    avatar_url = context.user_data.get(USER_AVATAR)
-
-    await update.message.reply_text("Generating your talking-head video...")
-    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
+    voice = await get_user_voice(update.effective_user.id)
 
     try:
-        # Step 1: TTS
         audio_bytes = await text_to_speech(text, voice=voice)
-
-        # Step 2: Talking head
-        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
-        video_bytes = await create_talking_head_video(audio_bytes, avatar_url=avatar_url)
-
-        # Step 3: Send video
-        await update.message.reply_video(
-            video=io.BytesIO(video_bytes),
-            filename="talking_head.mp4",
-            caption="Here's your talking-head video!",
-        )
     except Exception:
-        logger.exception("Failed to generate video for text message")
-        await update.message.reply_text(
-            "Sorry, something went wrong generating your video. Please try again."
-        )
+        logger.exception("TTS failed")
+        await update.message.reply_text("Sorry, text-to-speech failed. Please try again.")
+        return
+
+    await _generate_video(update, context, audio_bytes)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle voice/audio messages — transcribe, then generate video."""
     voice_msg = update.message.voice or update.message.audio
     if not voice_msg:
+        return
+
+    # Validate audio duration
+    duration = getattr(voice_msg, "duration", None)
+    if duration and duration > MAX_AUDIO_DURATION_SECONDS:
+        await update.message.reply_text(
+            f"Audio is too long ({duration}s). Maximum is {MAX_AUDIO_DURATION_SECONDS}s."
+        )
         return
 
     await update.message.reply_text("Transcribing your audio...")
@@ -164,42 +241,31 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("I couldn't detect any speech in that audio.")
         return
 
-    await update.message.reply_text(f'Transcript: "{transcript}"\n\nGenerating video...')
-    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
+    await update.message.reply_text(f'Transcript: "{transcript}"')
 
-    voice_name = context.user_data.get(USER_VOICE, DEFAULT_TTS_VOICE)
-    avatar_url = context.user_data.get(USER_AVATAR)
+    voice_name = await get_user_voice(update.effective_user.id)
 
     try:
-        audio_bytes = await text_to_speech(transcript, voice=voice_name)
-        video_bytes = await create_talking_head_video(audio_bytes, avatar_url=avatar_url)
-        await update.message.reply_video(
-            video=io.BytesIO(video_bytes),
-            filename="talking_head.mp4",
-            caption="Here's your talking-head video!",
-        )
+        tts_audio = await text_to_speech(transcript, voice=voice_name)
     except Exception:
-        logger.exception("Failed to generate video from voice message")
-        await update.message.reply_text(
-            "Sorry, something went wrong generating your video. Please try again."
-        )
+        logger.exception("TTS failed")
+        await update.message.reply_text("Sorry, text-to-speech failed. Please try again.")
+        return
+
+    await _generate_video(update, context, tts_audio)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle photo messages — set as custom avatar."""
+    """Handle photo messages — download and store as custom avatar."""
     photos = update.message.photo
     if not photos:
         return
 
-    # Use the largest resolution photo
-    photo = photos[-1]
+    photo = photos[-1]  # Largest resolution
 
     try:
-        tg_file = await context.bot.get_file(photo.file_id)
-        # Store the Telegram file URL as the avatar
-        # Note: Telegram file URLs expire, so for production you'd want to
-        # re-upload to a persistent store. For MVP, we re-fetch each time.
-        context.user_data[USER_AVATAR] = tg_file.file_path
+        photo_bytes = await download_telegram_file(context.bot, photo.file_id)
+        await set_user_avatar(update.effective_user.id, photo_bytes)
         await update.message.reply_text(
             "Avatar updated! I'll use this face for your next videos.\n"
             "Use /avatar_reset to go back to the default."

@@ -28,6 +28,9 @@ env/
 *.ogg
 *.webm
 
+# SQLite database
+data/
+
 # OS
 .DS_Store
 Thumbs.db
