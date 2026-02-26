@@ -2,7 +2,6 @@ import logging
 
 from telegram.ext import (
     ApplicationBuilder,
-    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     filters,
@@ -17,12 +16,8 @@ from bot.handlers import (
     handle_voice,
     help_command,
     start_command,
-    voice_callback,
-    voice_command,
 )
-from bot.keyboards import VOICE_CALLBACK_PREFIX
 from services.database import init_db
-from services.talking_head import check_kling_credentials
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -32,19 +27,11 @@ logger = logging.getLogger(__name__)
 
 
 async def post_init(application) -> None:
-    """Run after bot initialization — database setup and health checks."""
+    """Run after bot initialization — database setup."""
     await init_db()
 
     me = await application.bot.get_me()
     logger.info("Bot connected as @%s (id=%d)", me.username, me.id)
-
-    if await check_kling_credentials():
-        logger.info("Kling AI credentials verified.")
-    else:
-        logger.warning(
-            "Could not verify Kling AI credentials. "
-            "Video generation may fail — check KLING_ACCESS_KEY and KLING_SECRET_KEY."
-        )
 
 
 def main() -> None:
@@ -61,14 +48,8 @@ def main() -> None:
     # Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("voice", voice_command))
     app.add_handler(CommandHandler("avatar", avatar_command))
     app.add_handler(CommandHandler("avatar_reset", avatar_reset_command))
-
-    # Callback queries (inline buttons)
-    app.add_handler(
-        CallbackQueryHandler(voice_callback, pattern=f"^{VOICE_CALLBACK_PREFIX}")
-    )
 
     # Messages
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))

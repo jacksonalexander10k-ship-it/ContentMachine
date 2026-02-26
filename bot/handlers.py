@@ -6,24 +6,14 @@ from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
-from bot.config import (
-    AVAILABLE_VOICES,
-    DEFAULT_AVATAR_URL,
-    KLING_POLL_INTERVAL_SECONDS,
-    MAX_AUDIO_DURATION_SECONDS,
-    MAX_TEXT_LENGTH,
-)
-from bot.keyboards import VOICE_CALLBACK_PREFIX, voice_selection_keyboard
+from bot.config import DEFAULT_AVATAR_URL, MAX_AUDIO_DURATION_SECONDS, MAX_TEXT_LENGTH
 from services.database import (
     clear_user_avatar,
     get_user_avatar,
-    get_user_voice,
     set_user_avatar,
-    set_user_voice,
 )
 from services.segmenter import segment_script
-from services.talking_head import KlingAPIError, create_talking_head_video
-from services.tts import text_to_speech
+from services.talking_head import VideoGenerationError, generate_clip
 from services.transcribe import transcribe_audio
 from utils.media import download_telegram_file
 
@@ -41,9 +31,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "1. Send me a photo — that's your starting frame\n"
         "2. Send me a script — I'll split it into segments and generate "
         "a talking-head video clip for each one\n\n"
-        "Same starting frame, same lighting, same look — every clip.\n\n"
+        "Same starting frame, same lighting, same look — every clip.\n"
+        "Kling 3.0 generates the speech audio natively.\n\n"
         "Commands:\n"
-        "  /voice — Choose your TTS voice\n"
         "  /avatar — View or reset your starting frame\n"
         "  /help — Show this message again"
     )
@@ -54,19 +44,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await start_command(update, context)
 
 
-async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /voice — show voice picker."""
-    current = await get_user_voice(update.effective_user.id)
-    keyboard = voice_selection_keyboard(current)
-    await update.message.reply_text(
-        f"Current voice: *{current.capitalize()}*\n\nPick a new voice:",
-        reply_markup=keyboard,
-        parse_mode="Markdown",
-    )
-
-
 async def avatar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /avatar — show current avatar info."""
+    """Handle /avatar — show current starting frame info."""
     avatar = await get_user_avatar(update.effective_user.id)
     if avatar:
         await update.message.reply_text(
@@ -81,41 +60,16 @@ async def avatar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def avatar_reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /avatar_reset — clear custom avatar."""
+    """Handle /avatar_reset — clear starting frame."""
     await clear_user_avatar(update.effective_user.id)
     await update.message.reply_text("Starting frame cleared.")
-
-
-# ── Callback queries ─────────────────────────────────────────────────────────
-
-
-async def voice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle voice selection inline button."""
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data
-    if not data.startswith(VOICE_CALLBACK_PREFIX):
-        return
-
-    voice = data[len(VOICE_CALLBACK_PREFIX):]
-    if voice not in AVAILABLE_VOICES:
-        return
-
-    await set_user_voice(update.effective_user.id, voice)
-    keyboard = voice_selection_keyboard(voice)
-    await query.edit_message_text(
-        f"Voice set to *{voice.capitalize()}*!",
-        reply_markup=keyboard,
-        parse_mode="Markdown",
-    )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
 async def _get_avatar_bytes(user_id: int) -> bytes | None:
-    """Get avatar bytes for a user — custom from DB, or downloaded from default URL."""
+    """Get starting frame bytes for a user — custom from DB, or downloaded from default URL."""
     avatar = await get_user_avatar(user_id)
     if avatar:
         return avatar
@@ -145,7 +99,7 @@ async def _generate_clips(
     context: ContextTypes.DEFAULT_TYPE,
     script: str,
 ) -> None:
-    """Core pipeline: segment script -> TTS per segment -> Kling video per segment -> send clips."""
+    """Core pipeline: segment script -> Kling 3.0 video per segment (with native audio) -> send clips."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
@@ -157,8 +111,6 @@ async def _generate_clips(
             "Send me a photo of a face first, then send your script!"
         )
         return
-
-    voice = await get_user_voice(user_id)
 
     # Step 1: Segment the script
     status_msg = await update.message.reply_text("Segmenting script...")
@@ -175,42 +127,28 @@ async def _generate_clips(
         f"Script split into {total} clip{'s' if total != 1 else ''}. Starting generation..."
     )
 
-    # Step 2: Generate each clip sequentially
+    # Step 2: Generate each clip — same starting frame, Kling generates audio natively
     generated = 0
     for i, segment in enumerate(segments, 1):
         label = f"[Clip {i}/{total}]"
 
-        # TTS
-        await _edit_status(status_msg, f"{label} Generating audio...")
-        try:
-            audio_bytes = await text_to_speech(segment, voice=voice)
-        except Exception:
-            logger.exception("TTS failed for clip %d", i)
-            await update.message.reply_text(f"{label} Audio generation failed, skipping.")
-            continue
-
-        # Video generation with progress
-        await _edit_status(status_msg, f"{label} Generating video...")
+        await _edit_status(status_msg, f"{label} Generating video + audio...")
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
 
-        async def progress_cb(status: str, attempt: int, max_attempts: int) -> None:
-            elapsed = attempt * KLING_POLL_INTERVAL_SECONDS
-            await _edit_status(status_msg, f"{label} Generating video... ({elapsed}s)")
+        async def progress_cb(status_text: str) -> None:
+            await _edit_status(status_msg, f"{label} {status_text}")
             await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
 
         try:
-            video_bytes = await create_talking_head_video(
-                audio_bytes, avatar_bytes, progress_callback=progress_cb
+            video_bytes = await generate_clip(
+                avatar_bytes, segment, progress_callback=progress_cb
             )
-        except KlingAPIError as e:
-            logger.exception("Kling API error for clip %d", i)
+        except VideoGenerationError as e:
+            logger.exception("Video generation error for clip %d", i)
             await update.message.reply_text(f"{label} Failed: {e.user_message}")
             continue
-        except TimeoutError:
-            await update.message.reply_text(f"{label} Timed out, skipping.")
-            continue
         except Exception:
-            logger.exception("Video generation failed for clip %d", i)
+            logger.exception("Unexpected error for clip %d", i)
             await update.message.reply_text(f"{label} Failed, skipping.")
             continue
 
