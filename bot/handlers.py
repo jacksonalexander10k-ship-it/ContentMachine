@@ -21,6 +21,7 @@ from services.database import (
     set_user_avatar,
     set_user_voice,
 )
+from services.segmenter import segment_script
 from services.talking_head import KlingAPIError, create_talking_head_video
 from services.tts import text_to_speech
 from services.transcribe import transcribe_audio
@@ -36,13 +37,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Handle /start — welcome message."""
     await update.message.reply_text(
         "Welcome to ContentMachine!\n\n"
-        "Send me a text message and I'll turn it into a talking-head video.\n\n"
-        "You can also:\n"
-        "  - Send a voice note and I'll transcribe + generate a video\n"
-        "  - Send a photo to set your custom avatar\n\n"
+        "How it works:\n"
+        "1. Send me a photo — that's your starting frame\n"
+        "2. Send me a script — I'll split it into segments and generate "
+        "a talking-head video clip for each one\n\n"
+        "Same starting frame, same lighting, same look — every clip.\n\n"
         "Commands:\n"
         "  /voice — Choose your TTS voice\n"
-        "  /avatar — View or reset your avatar\n"
+        "  /avatar — View or reset your starting frame\n"
         "  /help — Show this message again"
     )
 
@@ -68,20 +70,20 @@ async def avatar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     avatar = await get_user_avatar(update.effective_user.id)
     if avatar:
         await update.message.reply_text(
-            "You have a custom avatar set.\n"
+            "You have a starting frame set.\n"
             "Send a new photo to change it, or use /avatar_reset to clear it."
         )
     else:
         await update.message.reply_text(
-            "You're using the default avatar.\n"
-            "Send me a photo of a face to use as your custom avatar!"
+            "No starting frame set yet.\n"
+            "Send me a photo of a face to use as your starting frame!"
         )
 
 
 async def avatar_reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /avatar_reset — clear custom avatar."""
     await clear_user_avatar(update.effective_user.id)
-    await update.message.reply_text("Avatar reset to default.")
+    await update.message.reply_text("Starting frame cleared.")
 
 
 # ── Callback queries ─────────────────────────────────────────────────────────
@@ -130,95 +132,132 @@ async def _get_avatar_bytes(user_id: int) -> bytes | None:
     return None
 
 
-async def _generate_video(
+async def _edit_status(msg, text: str) -> None:
+    """Edit a status message, ignoring errors (rate-limit, unchanged text)."""
+    try:
+        await msg.edit_text(text)
+    except Exception:
+        pass
+
+
+async def _generate_clips(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    audio_bytes: bytes,
+    script: str,
 ) -> None:
-    """Shared logic for generating and sending a talking-head video."""
+    """Core pipeline: segment script -> TTS per segment -> Kling video per segment -> send clips."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
+    # Get starting frame
     avatar_bytes = await _get_avatar_bytes(user_id)
     if not avatar_bytes:
         await update.message.reply_text(
-            "You don't have an avatar set yet.\n"
-            "Send me a photo of a face first, then try again!"
+            "You don't have a starting frame set yet.\n"
+            "Send me a photo of a face first, then send your script!"
         )
         return
 
-    status_msg = await update.message.reply_text("Starting video generation...")
-    await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+    voice = await get_user_voice(user_id)
 
-    async def progress_cb(status: str, attempt: int, max_attempts: int) -> None:
-        elapsed = attempt * KLING_POLL_INTERVAL_SECONDS
-        try:
-            await status_msg.edit_text(f"Generating video... ({elapsed}s elapsed)")
-            await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
-        except Exception:
-            pass  # Message edit can fail if text is unchanged or rate-limited
-
+    # Step 1: Segment the script
+    status_msg = await update.message.reply_text("Segmenting script...")
     try:
-        video_bytes = await create_talking_head_video(
-            audio_bytes, avatar_bytes, progress_callback=progress_cb
-        )
-        await status_msg.edit_text("Uploading video...")
+        segments = await segment_script(script)
+    except Exception:
+        logger.exception("Script segmentation failed")
+        await _edit_status(status_msg, "Failed to segment the script. Please try again.")
+        return
+
+    total = len(segments)
+    await _edit_status(
+        status_msg,
+        f"Script split into {total} clip{'s' if total != 1 else ''}. Starting generation..."
+    )
+
+    # Step 2: Generate each clip sequentially
+    generated = 0
+    for i, segment in enumerate(segments, 1):
+        label = f"[Clip {i}/{total}]"
+
+        # TTS
+        await _edit_status(status_msg, f"{label} Generating audio...")
+        try:
+            audio_bytes = await text_to_speech(segment, voice=voice)
+        except Exception:
+            logger.exception("TTS failed for clip %d", i)
+            await update.message.reply_text(f"{label} Audio generation failed, skipping.")
+            continue
+
+        # Video generation with progress
+        await _edit_status(status_msg, f"{label} Generating video...")
+        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+
+        async def progress_cb(status: str, attempt: int, max_attempts: int) -> None:
+            elapsed = attempt * KLING_POLL_INTERVAL_SECONDS
+            await _edit_status(status_msg, f"{label} Generating video... ({elapsed}s)")
+            await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+
+        try:
+            video_bytes = await create_talking_head_video(
+                audio_bytes, avatar_bytes, progress_callback=progress_cb
+            )
+        except KlingAPIError as e:
+            logger.exception("Kling API error for clip %d", i)
+            await update.message.reply_text(f"{label} Failed: {e.user_message}")
+            continue
+        except TimeoutError:
+            await update.message.reply_text(f"{label} Timed out, skipping.")
+            continue
+        except Exception:
+            logger.exception("Video generation failed for clip %d", i)
+            await update.message.reply_text(f"{label} Failed, skipping.")
+            continue
+
+        # Send the clip
+        await _edit_status(status_msg, f"{label} Uploading...")
         await update.message.reply_video(
             video=io.BytesIO(video_bytes),
-            filename="talking_head.mp4",
-            caption="Here's your talking-head video!",
+            filename=f"clip_{i}.mp4",
+            caption=f"Clip {i}/{total}",
         )
-        await status_msg.delete()
-    except KlingAPIError as e:
-        logger.exception("Kling API error during video generation")
-        await status_msg.edit_text(f"Error: {e.user_message}")
-    except TimeoutError:
-        await status_msg.edit_text(
-            "Video generation timed out. The service may be overloaded — please try again later."
-        )
-    except Exception:
-        logger.exception("Failed to generate video")
-        await status_msg.edit_text(
-            "Sorry, something went wrong generating your video. Please try again."
-        )
+        generated += 1
+
+    # Done
+    if generated == total:
+        await _edit_status(status_msg, f"Done — all {total} clips generated.")
+    elif generated > 0:
+        await _edit_status(status_msg, f"Done — {generated}/{total} clips generated.")
+    else:
+        await _edit_status(status_msg, "All clips failed. Please try again.")
 
 
 # ── Message handlers ─────────────────────────────────────────────────────────
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle plain text messages — generate talking-head video from text."""
+    """Handle plain text messages — segment script and generate clips."""
     text = update.message.text.strip()
 
     if not text:
-        await update.message.reply_text("Please send some text to generate a video.")
+        await update.message.reply_text("Please send a script to generate clips.")
         return
 
     if len(text) > MAX_TEXT_LENGTH:
         await update.message.reply_text(
-            f"Text is too long ({len(text)} chars). Max is {MAX_TEXT_LENGTH}."
+            f"Script is too long ({len(text)} chars). Max is {MAX_TEXT_LENGTH}."
         )
         return
 
-    voice = await get_user_voice(update.effective_user.id)
-
-    try:
-        audio_bytes = await text_to_speech(text, voice=voice)
-    except Exception:
-        logger.exception("TTS failed")
-        await update.message.reply_text("Sorry, text-to-speech failed. Please try again.")
-        return
-
-    await _generate_video(update, context, audio_bytes)
+    await _generate_clips(update, context, text)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle voice/audio messages — transcribe, then generate video."""
+    """Handle voice/audio messages — transcribe, then segment and generate clips."""
     voice_msg = update.message.voice or update.message.audio
     if not voice_msg:
         return
 
-    # Validate audio duration
     duration = getattr(voice_msg, "duration", None)
     if duration and duration > MAX_AUDIO_DURATION_SECONDS:
         await update.message.reply_text(
@@ -242,21 +281,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     await update.message.reply_text(f'Transcript: "{transcript}"')
-
-    voice_name = await get_user_voice(update.effective_user.id)
-
-    try:
-        tts_audio = await text_to_speech(transcript, voice=voice_name)
-    except Exception:
-        logger.exception("TTS failed")
-        await update.message.reply_text("Sorry, text-to-speech failed. Please try again.")
-        return
-
-    await _generate_video(update, context, tts_audio)
+    await _generate_clips(update, context, transcript)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle photo messages — download and store as custom avatar."""
+    """Handle photo messages — download and store as starting frame."""
     photos = update.message.photo
     if not photos:
         return
@@ -267,8 +296,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         photo_bytes = await download_telegram_file(context.bot, photo.file_id)
         await set_user_avatar(update.effective_user.id, photo_bytes)
         await update.message.reply_text(
-            "Avatar updated! I'll use this face for your next videos.\n"
-            "Use /avatar_reset to go back to the default."
+            "Starting frame set! I'll use this as the starting frame for all your clips.\n"
+            "Now send me a script to generate videos."
         )
     except Exception:
         logger.exception("Failed to set avatar from photo")

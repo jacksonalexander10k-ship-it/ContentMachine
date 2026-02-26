@@ -25,7 +25,7 @@ KLING_POLL_MAX_ATTEMPTS = 100  # ~5 minutes at 3s intervals
 KLING_MAX_CONCURRENT = int(os.getenv("KLING_MAX_CONCURRENT", "2"))
 
 # Limits
-MAX_TEXT_LENGTH = 2500
+MAX_TEXT_LENGTH = 10000  # scripts can be long
 MAX_AUDIO_DURATION_SECONDS = 300
 
 # Webhook (optional — if set, runs in webhook mode instead of polling)
