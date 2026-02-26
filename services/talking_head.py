@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable
 
@@ -36,6 +37,20 @@ DEFAULT_MOTION_PROMPT = (
     "Subtle hand movements and gestures while speaking, "
     "very occasionally looks away from the camera for ultra-realism."
 )
+
+# Speech rate for duration estimation (~2.5 words per second, conversational pace)
+_WORDS_PER_SECOND = 2.5
+
+
+def _estimate_duration(text: str) -> str:
+    """Estimate video duration (seconds) based on word count.
+
+    Returns a string from "3" to "15" suitable for the Kling V3 Pro API.
+    """
+    word_count = len(text.split())
+    seconds = math.ceil(word_count / _WORDS_PER_SECOND)
+    clamped = max(3, min(15, seconds))
+    return str(clamped)
 
 
 class VideoGenerationError(Exception):
@@ -98,7 +113,8 @@ async def generate_clip(
             f'{DEFAULT_MOTION_PROMPT}'
         )
 
-        logger.info("Submitting fal.ai clip: %s...", segment_text[:60])
+        duration = _estimate_duration(segment_text)
+        logger.info("Submitting fal.ai clip (duration=%ss): %s...", duration, segment_text[:60])
         start_time = time.monotonic()
 
         # Step 1: Submit the job
@@ -109,7 +125,7 @@ async def generate_clip(
                     "prompt": prompt,
                     "image_url": image_url,
                     "generate_audio": True,
-                    "duration": "5",
+                    "duration": duration,
                     "aspect_ratio": "9:16",
                 },
             )

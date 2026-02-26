@@ -62,7 +62,7 @@ async def segment_script(script: str) -> list[str]:
     logger.info("Segmenting script (%d chars)...", len(script))
 
     response = await _client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.2",
         messages=[
             {"role": "system", "content": _SEGMENTATION_PROMPT},
             {"role": "user", "content": script},
