@@ -83,6 +83,9 @@ async def generate_clip(
 
     Returns:
         The generated MP4 video as bytes.
+
+    Raises:
+        VideoGenerationError: Always raised with a user-facing message on failure.
     """
     async with _semaphore:
         image_url = _image_to_data_url(image_bytes)
@@ -98,6 +101,7 @@ async def generate_clip(
         logger.info("Submitting fal.ai clip: %s...", segment_text[:60])
         start_time = time.monotonic()
 
+        # Step 1: Submit the job
         try:
             handle = await fal_client.submit_async(
                 FAL_MODEL,
@@ -109,38 +113,58 @@ async def generate_clip(
                     "aspect_ratio": "9:16",
                 },
             )
+        except Exception as e:
+            elapsed = _format_elapsed(start_time)
+            logger.exception("fal.ai submit failed after %s", elapsed)
+            raise VideoGenerationError(
+                f"Failed to submit to fal.ai ({elapsed}): {type(e).__name__}: {e}"
+            ) from e
 
-            request_id = getattr(handle, "request_id", None)
-            logger.info("fal.ai job submitted (request_id=%s)", request_id)
+        request_id = getattr(handle, "request_id", None)
+        logger.info("fal.ai job submitted (request_id=%s)", request_id)
 
-            if progress_callback:
-                elapsed = _format_elapsed(start_time)
-                await _safe_callback(progress_callback, f"Submitted to fal.ai ({elapsed})")
+        if progress_callback:
+            await _safe_callback(progress_callback, f"Submitted to fal.ai (0s)")
 
-            # Poll for progress with a heartbeat so the user always sees updates
+        # Step 2: Poll for completion with heartbeat
+        try:
             result = await asyncio.wait_for(
                 _poll_with_heartbeat(handle, progress_callback, start_time),
                 timeout=CLIP_TIMEOUT_SECONDS,
             )
-
         except asyncio.TimeoutError:
             elapsed = _format_elapsed(start_time)
             logger.error("fal.ai clip timed out after %s", elapsed)
             raise VideoGenerationError(
-                f"Video generation timed out after {elapsed}. Please try again."
+                f"Video generation timed out after {elapsed}. "
+                f"fal.ai may be overloaded — try again in a minute."
             )
         except VideoGenerationError:
             raise
         except Exception as e:
             elapsed = _format_elapsed(start_time)
-            logger.exception("fal.ai request failed after %s", elapsed)
+            logger.exception("fal.ai polling failed after %s", elapsed)
             raise VideoGenerationError(
-                f"Video generation failed after {elapsed}: {e}"
+                f"Video generation failed after {elapsed}: {type(e).__name__}: {e}"
             ) from e
+
+        # Step 3: Extract video URL from result
+        if not isinstance(result, dict):
+            logger.error("fal.ai returned non-dict result: %s", type(result).__name__)
+            raise VideoGenerationError(
+                f"Unexpected response from fal.ai (got {type(result).__name__} instead of dict). "
+                f"The API may have changed."
+            )
 
         video_info = result.get("video")
         if not video_info or not video_info.get("url"):
-            raise VideoGenerationError("No video URL in response.")
+            # Log the full result for debugging
+            logger.error("fal.ai result missing video URL. Keys: %s, Full result: %s",
+                         list(result.keys()), str(result)[:500])
+            raise VideoGenerationError(
+                f"fal.ai completed but returned no video URL. "
+                f"Response keys: {list(result.keys())}. This may be a fal.ai issue."
+            )
 
         video_url = video_info["url"]
         elapsed = _format_elapsed(start_time)
@@ -149,7 +173,23 @@ async def generate_clip(
         if progress_callback:
             await _safe_callback(progress_callback, f"Downloading video ({elapsed})")
 
-        return await _download_video(video_url)
+        # Step 4: Download the video
+        try:
+            video_bytes = await _download_video(video_url)
+        except Exception as e:
+            elapsed = _format_elapsed(start_time)
+            logger.exception("Video download failed after %s", elapsed)
+            raise VideoGenerationError(
+                f"Video was generated but download failed ({elapsed}): {type(e).__name__}: {e}"
+            ) from e
+
+        elapsed = _format_elapsed(start_time)
+        logger.info("Clip complete: %d bytes in %s", len(video_bytes), elapsed)
+
+        if progress_callback:
+            await _safe_callback(progress_callback, f"Video ready ({elapsed})")
+
+        return video_bytes
 
 
 async def _safe_callback(callback: ProgressCallback, text: str) -> None:
@@ -219,7 +259,15 @@ async def _poll_with_heartbeat(
             else:
                 logger.debug("fal.ai event type: %s", type(event).__name__)
 
-        return await handle.get()
+        # iter_events finished — get the result
+        logger.info("fal.ai events complete, fetching result...")
+        if progress_callback:
+            elapsed = _format_elapsed(start_time)
+            await _safe_callback(progress_callback, f"Fetching result... ({elapsed})")
+
+        result = await handle.get()
+        logger.info("fal.ai result received (type=%s)", type(result).__name__)
+        return result
     finally:
         heartbeat_task.cancel()
         try:
@@ -229,10 +277,19 @@ async def _poll_with_heartbeat(
 
 
 async def _download_video(url: str) -> bytes:
-    """Download the generated video."""
+    """Download the generated video with retries."""
     logger.info("Downloading video from %s", url)
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-    logger.info("Video downloaded: %d bytes", len(resp.content))
-    return resp.content
+    last_error = None
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+            logger.info("Video downloaded: %d bytes", len(resp.content))
+            return resp.content
+        except Exception as e:
+            last_error = e
+            logger.warning("Download attempt %d failed: %s", attempt + 1, e)
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+    raise last_error

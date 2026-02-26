@@ -13,8 +13,22 @@ _SEGMENTATION_PROMPT = """\
 You are a script segmentation assistant. Your job is to split a spoken script \
 into natural segments for talking-head video clip generation.
 
-Each segment will become a SEPARATE video clip with the same starting frame, \
-so segments must sound natural and complete when spoken individually.
+FIRST: Determine if the input is actually a speakable script. A valid script \
+is text that a person could naturally speak to camera — a monologue, \
+presentation, tutorial, story, pitch, narration, etc.
+
+REJECT the input (return empty segments) if it is:
+- Random gibberish, keyboard mashing, or nonsense words
+- A question or command directed at a chatbot (e.g. "what can you do?", \
+"generate me a script about X", "help me with Y")
+- A request to CREATE content rather than actual content to be spoken
+- Code, URLs, or non-speakable technical text
+- Just a few random unrelated words that don't form coherent speech
+
+If the input is NOT a valid speakable script, return:
+{"segments": [], "rejected": true, "reason": "<brief explanation>"}
+
+If the input IS a valid script, segment it:
 
 Rules:
 - Each segment should be roughly 10-30 words (approx 5-15 seconds of speech).
@@ -28,13 +42,22 @@ short sentences, or a natural clause — but it must make sense when heard alone
 - If the script is very short (one sentence or under 30 words), return it as \
 a single segment.
 
-Return a JSON object: {"segments": ["segment 1 text", "segment 2 text", ...]}"""
+Return: {"segments": ["segment 1 text", "segment 2 text", ...], "rejected": false}"""
+
+
+class ScriptRejected(Exception):
+    """The input was not a valid speakable script."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
 
 
 async def segment_script(script: str) -> list[str]:
     """Split a script into natural speech segments using OpenAI.
 
     Returns a list of segment strings preserving original wording.
+    Raises ScriptRejected if the input is not a valid speakable script.
     """
     logger.info("Segmenting script (%d chars)...", len(script))
 
@@ -49,7 +72,16 @@ async def segment_script(script: str) -> list[str]:
     )
 
     result = json.loads(response.choices[0].message.content)
+
+    # Check if the segmenter rejected the input
+    if result.get("rejected"):
+        reason = result.get("reason", "That doesn't look like a speakable script.")
+        logger.info("Script rejected: %s", reason)
+        raise ScriptRejected(reason)
+
     segments = result["segments"]
+    if not segments:
+        raise ScriptRejected("Could not extract any speakable segments from that text.")
 
     logger.info("Script segmented into %d parts: %s",
                 len(segments),

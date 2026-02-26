@@ -16,6 +16,7 @@ from bot.handlers import (
     handle_voice,
     help_command,
     start_command,
+    status_command,
     stop_command,
 )
 from services.database import init_db
@@ -52,6 +53,7 @@ def main() -> None:
     app.add_handler(CommandHandler("avatar", avatar_command))
     app.add_handler(CommandHandler("avatar_reset", avatar_reset_command))
     app.add_handler(CommandHandler("stop", stop_command))
+    app.add_handler(CommandHandler("status", status_command))
 
     # Messages
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
