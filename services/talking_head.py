@@ -19,8 +19,8 @@ ProgressCallback = Callable[[str], Awaitable[None]]
 
 FAL_MODEL = "fal-ai/kling-video/v3/pro/image-to-video"
 
-# Timeout for a single clip generation (5 minutes)
-CLIP_TIMEOUT_SECONDS = 300
+# Timeout for a single clip generation (10 minutes)
+CLIP_TIMEOUT_SECONDS = 600
 
 # How often to send heartbeat updates when fal.ai is silent (seconds)
 HEARTBEAT_INTERVAL = 15
