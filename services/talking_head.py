@@ -25,6 +25,12 @@ CLIP_TIMEOUT_SECONDS = 300
 # How often to send heartbeat updates when fal.ai is silent (seconds)
 HEARTBEAT_INTERVAL = 15
 
+# Voice direction — consistent East London accent across all clips
+VOICE_PROMPT = (
+    "The speaker has an East London UK accent. "
+    "Well-spoken but distinctly East London — natural, confident, conversational tone."
+)
+
 # Default motion prompt — subtle realism
 DEFAULT_MOTION_PROMPT = (
     "Subtle hand movements and gestures while speaking, "
@@ -81,8 +87,9 @@ async def generate_clip(
     async with _semaphore:
         image_url = _image_to_data_url(image_bytes)
 
-        # Build the prompt: the spoken text + motion direction
+        # Build the prompt: voice direction + spoken text + motion direction
         prompt = (
+            f'{VOICE_PROMPT} '
             f'The person in the image speaks directly to camera and says: '
             f'"{segment_text}" '
             f'{DEFAULT_MOTION_PROMPT}'

@@ -35,6 +35,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Kling 3.0 generates the speech audio natively.\n\n"
         "Commands:\n"
         "  /avatar — View or reset your starting frame\n"
+        "  /stop — Cancel the current generation\n"
         "  /help — Show this message again"
     )
 
@@ -63,6 +64,15 @@ async def avatar_reset_command(update: Update, context: ContextTypes.DEFAULT_TYP
     """Handle /avatar_reset — clear starting frame."""
     await clear_user_avatar(update.effective_user.id)
     await update.message.reply_text("Starting frame cleared.")
+
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /stop — cancel any running generation for this user."""
+    if context.user_data.get("generating"):
+        context.user_data["cancel"] = True
+        await update.message.reply_text("Stopping after the current clip finishes...")
+    else:
+        await update.message.reply_text("Nothing is generating right now.")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -129,46 +139,74 @@ async def _generate_clips(
 
     # Step 2: Generate each clip — same starting frame, Kling generates audio natively
     generated = 0
-    for i, segment in enumerate(segments, 1):
-        label = f"[Clip {i}/{total}]"
+    context.user_data["generating"] = True
+    context.user_data["cancel"] = False
 
-        preview = segment[:40] + ("..." if len(segment) > 40 else "")
-        await _edit_status(status_msg, f"{label} Generating video + audio...\n\"{preview}\"")
-        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+    try:
+        for i, segment in enumerate(segments, 1):
+            # Check for /stop cancellation
+            if context.user_data.get("cancel"):
+                await _edit_status(
+                    status_msg,
+                    f"Stopped — {generated}/{total} clips generated. (Cancelled by /stop)",
+                )
+                return
 
-        async def progress_cb(status_text: str, _label=label, _preview=preview) -> None:
-            await _edit_status(status_msg, f"{_label} {status_text}\n\"{_preview}\"")
+            label = f"[Clip {i}/{total}]"
+
+            preview = segment[:40] + ("..." if len(segment) > 40 else "")
+            await _edit_status(status_msg, f"{label} Generating video + audio...\n\"{preview}\"")
             await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
 
-        try:
-            video_bytes = await generate_clip(
-                avatar_bytes, segment, progress_callback=progress_cb
+            async def progress_cb(status_text: str, _label=label, _preview=preview) -> None:
+                await _edit_status(status_msg, f"{_label} {status_text}\n\"{_preview}\"")
+                await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+
+            try:
+                video_bytes = await generate_clip(
+                    avatar_bytes, segment, progress_callback=progress_cb
+                )
+            except VideoGenerationError as e:
+                logger.exception("Video generation error for clip %d", i)
+                await update.message.reply_text(f"{label} Failed: {e.user_message}")
+                continue
+            except Exception:
+                logger.exception("Unexpected error for clip %d", i)
+                await update.message.reply_text(f"{label} Failed, skipping.")
+                continue
+
+            # Check for /stop again after generation completes
+            if context.user_data.get("cancel"):
+                # Still send the clip that just finished, then stop
+                pass
+
+            # Send the clip
+            await _edit_status(status_msg, f"{label} Uploading...")
+            await update.message.reply_video(
+                video=io.BytesIO(video_bytes),
+                filename=f"clip_{i}.mp4",
+                caption=f"Clip {i}/{total}",
             )
-        except VideoGenerationError as e:
-            logger.exception("Video generation error for clip %d", i)
-            await update.message.reply_text(f"{label} Failed: {e.user_message}")
-            continue
-        except Exception:
-            logger.exception("Unexpected error for clip %d", i)
-            await update.message.reply_text(f"{label} Failed, skipping.")
-            continue
+            generated += 1
 
-        # Send the clip
-        await _edit_status(status_msg, f"{label} Uploading...")
-        await update.message.reply_video(
-            video=io.BytesIO(video_bytes),
-            filename=f"clip_{i}.mp4",
-            caption=f"Clip {i}/{total}",
-        )
-        generated += 1
+            # If cancelled, stop after uploading the finished clip
+            if context.user_data.get("cancel"):
+                await _edit_status(
+                    status_msg,
+                    f"Stopped — {generated}/{total} clips generated. (Cancelled by /stop)",
+                )
+                return
 
-    # Done
-    if generated == total:
-        await _edit_status(status_msg, f"Done — all {total} clips generated.")
-    elif generated > 0:
-        await _edit_status(status_msg, f"Done — {generated}/{total} clips generated.")
-    else:
-        await _edit_status(status_msg, "All clips failed. Please try again.")
+        # Done
+        if generated == total:
+            await _edit_status(status_msg, f"Done — all {total} clips generated.")
+        elif generated > 0:
+            await _edit_status(status_msg, f"Done — {generated}/{total} clips generated.")
+        else:
+            await _edit_status(status_msg, "All clips failed. Please try again.")
+    finally:
+        context.user_data["generating"] = False
+        context.user_data["cancel"] = False
 
 
 # ── Message handlers ─────────────────────────────────────────────────────────
