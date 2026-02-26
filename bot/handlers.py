@@ -132,11 +132,12 @@ async def _generate_clips(
     for i, segment in enumerate(segments, 1):
         label = f"[Clip {i}/{total}]"
 
-        await _edit_status(status_msg, f"{label} Generating video + audio...")
+        preview = segment[:40] + ("..." if len(segment) > 40 else "")
+        await _edit_status(status_msg, f"{label} Generating video + audio...\n\"{preview}\"")
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
 
-        async def progress_cb(status_text: str) -> None:
-            await _edit_status(status_msg, f"{label} {status_text}")
+        async def progress_cb(status_text: str, _label=label, _preview=preview) -> None:
+            await _edit_status(status_msg, f"{_label} {status_text}\n\"{_preview}\"")
             await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
 
         try:

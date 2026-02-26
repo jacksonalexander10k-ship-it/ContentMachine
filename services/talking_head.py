@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import logging
+import time
 from collections.abc import Awaitable, Callable
 
 import httpx
@@ -17,6 +18,12 @@ _semaphore = asyncio.Semaphore(FAL_MAX_CONCURRENT)
 ProgressCallback = Callable[[str], Awaitable[None]]
 
 FAL_MODEL = "fal-ai/kling-video/v3/pro/image-to-video"
+
+# Timeout for a single clip generation (5 minutes)
+CLIP_TIMEOUT_SECONDS = 300
+
+# How often to send heartbeat updates when fal.ai is silent (seconds)
+HEARTBEAT_INTERVAL = 15
 
 # Default motion prompt — subtle realism
 DEFAULT_MOTION_PROMPT = (
@@ -42,6 +49,15 @@ def _image_to_data_url(image_bytes: bytes) -> str:
     else:
         mime = "image/jpeg"
     return f"data:{mime};base64,{b64}"
+
+
+def _format_elapsed(start: float) -> str:
+    """Format elapsed time since start as a human-readable string."""
+    elapsed = int(time.monotonic() - start)
+    if elapsed < 60:
+        return f"{elapsed}s"
+    minutes, seconds = divmod(elapsed, 60)
+    return f"{minutes}m {seconds}s"
 
 
 async def generate_clip(
@@ -73,6 +89,7 @@ async def generate_clip(
         )
 
         logger.info("Submitting fal.ai clip: %s...", segment_text[:60])
+        start_time = time.monotonic()
 
         try:
             handle = await fal_client.submit_async(
@@ -86,22 +103,32 @@ async def generate_clip(
                 },
             )
 
-            # Poll for progress
-            async for event in handle.iter_events(with_logs=True):
-                if isinstance(event, fal_client.InProgress):
-                    if progress_callback and event.logs:
-                        latest = event.logs[-1].get("message", "Processing...")
-                        try:
-                            await progress_callback(latest)
-                        except Exception:
-                            pass
+            request_id = getattr(handle, "request_id", None)
+            logger.info("fal.ai job submitted (request_id=%s)", request_id)
 
-            result = await handle.get()
+            if progress_callback:
+                elapsed = _format_elapsed(start_time)
+                await _safe_callback(progress_callback, f"Submitted to fal.ai ({elapsed})")
 
-        except Exception as e:
-            logger.exception("fal.ai request failed")
+            # Poll for progress with a heartbeat so the user always sees updates
+            result = await asyncio.wait_for(
+                _poll_with_heartbeat(handle, progress_callback, start_time),
+                timeout=CLIP_TIMEOUT_SECONDS,
+            )
+
+        except asyncio.TimeoutError:
+            elapsed = _format_elapsed(start_time)
+            logger.error("fal.ai clip timed out after %s", elapsed)
             raise VideoGenerationError(
-                f"Video generation failed: {e}"
+                f"Video generation timed out after {elapsed}. Please try again."
+            )
+        except VideoGenerationError:
+            raise
+        except Exception as e:
+            elapsed = _format_elapsed(start_time)
+            logger.exception("fal.ai request failed after %s", elapsed)
+            raise VideoGenerationError(
+                f"Video generation failed after {elapsed}: {e}"
             ) from e
 
         video_info = result.get("video")
@@ -109,9 +136,89 @@ async def generate_clip(
             raise VideoGenerationError("No video URL in response.")
 
         video_url = video_info["url"]
-        logger.info("Clip ready: %s", video_url)
+        elapsed = _format_elapsed(start_time)
+        logger.info("Clip ready after %s: %s", elapsed, video_url)
+
+        if progress_callback:
+            await _safe_callback(progress_callback, f"Downloading video ({elapsed})")
 
         return await _download_video(video_url)
+
+
+async def _safe_callback(callback: ProgressCallback, text: str) -> None:
+    """Call a progress callback, swallowing exceptions."""
+    try:
+        await callback(text)
+    except Exception:
+        pass
+
+
+async def _poll_with_heartbeat(
+    handle,
+    progress_callback: ProgressCallback | None,
+    start_time: float,
+) -> dict:
+    """Poll fal.ai for events while sending periodic heartbeat updates.
+
+    Returns the final result dict.
+    """
+    last_status = "Processing..."
+    last_update_time = time.monotonic()
+
+    async def _heartbeat_loop():
+        """Background task that sends elapsed-time updates when fal.ai is quiet."""
+        nonlocal last_update_time
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            if progress_callback:
+                elapsed = _format_elapsed(start_time)
+                await _safe_callback(
+                    progress_callback,
+                    f"{last_status} ({elapsed})",
+                )
+                last_update_time = time.monotonic()
+
+    heartbeat_task = asyncio.create_task(_heartbeat_loop())
+
+    try:
+        async for event in handle.iter_events(with_logs=True):
+            if isinstance(event, fal_client.InProgress):
+                if event.logs:
+                    for log_entry in event.logs:
+                        # Handle both dict and object log entries
+                        if isinstance(log_entry, dict):
+                            msg = log_entry.get("message", "")
+                        else:
+                            msg = getattr(log_entry, "message", "")
+                        if msg:
+                            last_status = msg
+                            logger.info("fal.ai progress: %s", msg)
+                    if progress_callback:
+                        elapsed = _format_elapsed(start_time)
+                        await _safe_callback(
+                            progress_callback,
+                            f"{last_status} ({elapsed})",
+                        )
+                        last_update_time = time.monotonic()
+                else:
+                    # InProgress event but no logs — still show heartbeat
+                    logger.debug("fal.ai InProgress event (no logs)")
+                    if progress_callback:
+                        elapsed = _format_elapsed(start_time)
+                        await _safe_callback(
+                            progress_callback,
+                            f"Processing... ({elapsed})",
+                        )
+            else:
+                logger.debug("fal.ai event type: %s", type(event).__name__)
+
+        return await handle.get()
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
 
 
 async def _download_video(url: str) -> bytes:
